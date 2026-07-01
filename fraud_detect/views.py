@@ -7,6 +7,7 @@ from .engine import compute_risk_level, score_claim_ml
 from .models import FraudFlag, ReviewerOverride
 from .rules import evaluate_rules
 from .serializers import FraudFlagSerializer, ReviewerOverrideSerializer
+from .signals import _build_claim_dict
 
 
 class ClaimFraudFlagView(APIView):
@@ -125,3 +126,48 @@ class ScoreClaimView(APIView):
             "ml": ml_result,
             "overall_risk_level": risk_level,
         })
+
+
+class RescoreClaimView(APIView):
+    """
+    POST /api/fraud_detect/rescore/{claim_id}/
+
+    Fetches the live Claim row from the database, scores it through both the
+    rules engine and the ML model, and persists the result to tbl_FraudFlag
+    (insert on first call, update on subsequent calls).
+
+    Returns the saved FraudFlag record.  Returns 404 if the claim_id does not
+    exist in the Claim table, or 503 if the claim module is not installed.
+    """
+
+    def post(self, request, claim_id):
+        try:
+            from claim.models import Claim
+        except ImportError:
+            return Response(
+                {"detail": "The claim module is not installed in this environment."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        claim = get_object_or_404(Claim, id=claim_id)
+
+        claim_dict = _build_claim_dict(claim)
+        rules_result = evaluate_rules(claim_dict)
+        ml_result = score_claim_ml(claim_dict)
+        risk_level = compute_risk_level(rules_result, ml_result)
+
+        flag, created = FraudFlag.objects.update_or_create(
+            claim_id=claim_id,
+            defaults={
+                "is_rule_flagged": rules_result["is_flagged"],
+                "rule_flag_reasons": rules_result["fired_rules"],
+                "anomaly_score": ml_result["anomaly_score"],
+                "is_ml_anomaly": ml_result["is_anomaly"],
+                "overall_risk_level": risk_level,
+            },
+        )
+
+        return Response(
+            FraudFlagSerializer(flag).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )

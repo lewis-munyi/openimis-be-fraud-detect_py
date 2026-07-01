@@ -193,6 +193,7 @@ All endpoints are mounted at `/api/fraud_detect/` by openIMIS's URL router
 | GET | `/api/fraud_detect/flags/{claim_id}/` | Get the flag for a specific claim |
 | POST | `/api/fraud_detect/override/` | Submit a reviewer override decision |
 | POST | `/api/fraud_detect/score/` | Score a raw claim dict on demand (no DB write) |
+| POST | `/api/fraud_detect/rescore/{claim_id}/` | Score an existing claim from the DB and persist the result |
 
 > **Shell tip**: Write curl commands as a single line. A bare backslash-newline
 > continuation in zsh can silently split the command, causing `command not found: -H`.
@@ -228,7 +229,10 @@ curl -s "http://localhost/api/fraud_detect/flags/" | python3 -m json.tool
       "id": 42,
       "claim_id": 1017,
       "is_rule_flagged": true,
-      "rule_flag_reasons": "[\"Invoice inflation above 3x\", \"Vague ICD code used\"]",
+      "rule_flag_reasons": [
+        {"name": "Invoice inflation above 3x", "description": "The invoiced amount is more than 3 times the amount that was approved for payment. This suggests deliberate overbilling."},
+        {"name": "Vague ICD code used", "description": "ICD code Z51.9 is a known non-specific catch-all diagnosis."}
+      ],
       "anomaly_score": -0.305,
       "is_ml_anomaly": true,
       "overall_risk_level": "HIGH",
@@ -295,7 +299,10 @@ curl -s "http://localhost/api/fraud_detect/flags/1017/" | python3 -m json.tool
   "id": 42,
   "claim_id": 1017,
   "is_rule_flagged": true,
-  "rule_flag_reasons": "[\"Invoice inflation above 3x\", \"Vague ICD code used\"]",
+  "rule_flag_reasons": [
+    {"name": "Invoice inflation above 3x", "description": "The invoiced amount is more than 3 times the amount that was approved for payment. This suggests deliberate overbilling."},
+    {"name": "Vague ICD code used", "description": "ICD code Z51.9 is a known non-specific catch-all diagnosis."}
+  ],
   "anomaly_score": -0.305,
   "is_ml_anomaly": true,
   "overall_risk_level": "HIGH",
@@ -315,7 +322,7 @@ curl -s "http://localhost/api/fraud_detect/flags/1001/" | python3 -m json.tool
   "id": 10,
   "claim_id": 1001,
   "is_rule_flagged": false,
-  "rule_flag_reasons": "[]",
+  "rule_flag_reasons": [],
   "anomaly_score": 0.142,
   "is_ml_anomaly": false,
   "overall_risk_level": "LOW",
@@ -568,6 +575,142 @@ curl -s -X POST http://localhost/api/fraud_detect/score/ -H "Content-Type: appli
   "overall_risk_level": "LOW"
 }
 ```
+
+---
+
+### POST `/api/fraud_detect/rescore/{claim_id}/`
+
+Fetches the live `Claim` row from the database by ID, runs both the rules engine
+and the ML model against it, and writes the result to `tbl_FraudFlag` using
+`update_or_create`. Returns the saved `FraudFlag` record.
+
+This is the correct endpoint when:
+- A claim was created **before** the fraud detection module was installed (so
+  the `post_save` signal never fired for it).
+- You want to **re-score** a claim after retraining the model.
+- You need to **backfill** fraud flags for a batch of existing claims.
+
+The `post_save` signal handles scoring automatically for all future claim saves.
+Use this endpoint only for claims that already exist in the DB without a flag.
+
+**No request body required.**
+
+**Response**
+- `201 Created` — flag did not exist before; it was just created.
+- `200 OK` — flag already existed; it has been updated with a fresh score.
+- `404 Not Found` — no `Claim` with that ID exists in the database.
+- `503 Service Unavailable` — the `claim` openIMIS module is not installed.
+
+#### Example: score and persist a claim for the first time
+
+```bash
+curl -s -X POST http://localhost/api/fraud_detect/rescore/1042/ | python3 -m json.tool
+```
+
+```json
+{
+  "id": 95,
+  "claim_id": 1042,
+  "is_rule_flagged": true,
+  "rule_flag_reasons": [
+    {"name": "Invoice inflation above 3x", "description": "The invoiced amount is more than 3 times the amount that was approved for payment. This suggests deliberate overbilling."}
+  ],
+  "anomaly_score": -0.198,
+  "is_ml_anomaly": false,
+  "overall_risk_level": "MEDIUM",
+  "created_at": "2026-07-01T15:30:00.000000Z",
+  "updated_at": "2026-07-01T15:30:00.000000Z"
+}
+```
+
+HTTP status: `201 Created`.
+
+#### Example: re-score an already-flagged claim → 200 OK
+
+The flag row is updated in-place. `created_at` stays the same; `updated_at` changes.
+
+```bash
+curl -s -w "\nHTTP %{http_code}\n" -X POST http://localhost/api/fraud_detect/rescore/1042/ | python3 -m json.tool
+```
+
+```json
+{
+  "id": 95,
+  "claim_id": 1042,
+  "is_rule_flagged": true,
+  "rule_flag_reasons": [
+    {"name": "Invoice inflation above 3x", "description": "The invoiced amount is more than 3 times the amount that was approved for payment. This suggests deliberate overbilling."}
+  ],
+  "anomaly_score": -0.198,
+  "is_ml_anomaly": false,
+  "overall_risk_level": "MEDIUM",
+  "created_at": "2026-07-01T15:30:00.000000Z",
+  "updated_at": "2026-07-01T16:05:33.000000Z"
+}
+```
+
+HTTP status: `200 OK`.
+
+#### Example: re-score after model retraining
+
+```bash
+# Retrain the model
+docker compose -f compose.yml -f compose.fraud-detect.yml exec backend python manage.py retrain_fraud_model
+docker compose -f compose.yml -f compose.fraud-detect.yml restart backend
+
+# Now re-score any specific claim with the new model
+curl -s -X POST http://localhost/api/fraud_detect/rescore/1017/ | python3 -m json.tool
+```
+
+The response shape is identical to the 200/201 examples above; the score values
+will differ if the new model weights changed.
+
+#### Example: backfill all unscored claims with a shell loop
+
+```bash
+# Fetch every claim_id that has no FraudFlag yet, then rescore each one
+curl -s "http://localhost/api/fraud_detect/flags/?limit=1000" | python3 -c "
+import json, sys
+scored = {r['claim_id'] for r in json.load(sys.stdin)['results']}
+print(' '.join(str(c) for c in scored))
+" > /tmp/already_scored.txt
+
+# (Then iterate over your full claim ID list and skip those already scored)
+```
+
+#### Example: soft-deleted or non-existent claim → 404
+
+openIMIS soft-deletes records by setting `ValidityTo`. The default Claim manager
+excludes them, so rescoring a superseded claim also returns 404.
+
+```bash
+curl -s -X POST http://localhost/api/fraud_detect/rescore/99999/ | python3 -m json.tool
+```
+
+```json
+{
+  "detail": "No Claim matches the given query."
+}
+```
+
+HTTP status: `404 Not Found`.
+
+#### Example: claim module not installed → 503
+
+Occurs when the `fraud_detect` module is running in a test environment that does
+not have the `claim` openIMIS module in `openimis.json`.
+
+```bash
+curl -s -X POST http://localhost/api/fraud_detect/rescore/1042/ | python3 -m json.tool
+```
+
+```json
+{
+  "detail": "The claim module is not installed in this environment."
+}
+```
+
+HTTP status: `503 Service Unavailable`.
 
 ---
 
