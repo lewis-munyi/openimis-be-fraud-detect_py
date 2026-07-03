@@ -184,7 +184,10 @@ docker compose -f compose.yml -f compose.fraud-detect.yml exec backend \
 
 The command saves `models/fraud_model.joblib` and `models/fraud_scaler.joblib`
 to the host filesystem via the bind mount, so they survive container restarts.
-After training, restart the backend to load the new artefacts:
+It also evaluates the new model on a held-out 20% split and regenerates
+[models/README.md](models/README.md) with the fresh performance report — so the
+report is never stale. After training, restart the backend to load the new
+artefacts:
 
 ```bash
 docker compose -f compose.yml -f compose.fraud-detect.yml restart backend
