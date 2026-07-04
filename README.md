@@ -1043,10 +1043,10 @@ Two expected warnings appear in the output:
 | 5 — FHIR Extensions | Complete (`fhir_extensions.py`) |
 | 6 — Feedback Loop | Complete (`retrain_fraud_model` management command) |
 | 7 — Unit Tests | Complete (36 tests passing) |
-| 8 — Frontend Badge | In progress |
+| 8 — Frontend Badge | Complete |
 | 9 — Performance Report | Complete (see [models/README.md](models/README.md)) |
-| 10 — Documentation | In progress |
-| 11 — Demo Preparation | In progress |
+| 10 — Documentation | Complete |
+| 11 — Demo Preparation | Complete |
 
 ---
 
